@@ -170,9 +170,7 @@ def _patch_tensor_log_():
     musa_module = getattr(torch, "musa", None)
     if (
         not is_musa_platform()
-        or not _is_pre_torch_musa_2_11_0_post2(
-            getattr(musa_module, "__version__", None)
-        )
+        or not _is_pre_torch_musa_2_11_0_post2(getattr(musa_module, "__version__", None))
         or _original_tensor_log_ is not None
     ):
         return
@@ -1810,8 +1808,9 @@ _TORCH_MUSA_POST2_VERSION = "2.11.0.post2"
 def _is_pre_torch_musa_2_11_0_post2(version) -> bool:
     """Return whether the torch_musa version predates 2.11.0.post2.
 
-    torch_musa 2.11.0.post2 fixes the unified accelerator memory APIs. Older
-    releases still need torchada to force those calls through torch.musa.
+    torch_musa 2.11.0.post2 fixes the unified accelerator memory APIs and the
+    float64 in-place ``Tensor.log_``. Older releases still need torchada to
+    force those memory calls through torch.musa and to backport the log path.
     Ignore the local version suffix (for example ``+musa5.2.0``), because it
     identifies the MUSA stack build rather than the torch_musa fix level.
 
