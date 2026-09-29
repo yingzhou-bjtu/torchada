@@ -3,6 +3,7 @@
 #include <mufft.h>
 #include <torch_musa/csrc/core/MUSAStream.h>
 
+#include <cstdint>
 #include <mutex>
 #include <unordered_map>
 
@@ -11,25 +12,27 @@ namespace {
 struct PlanKey {
     int n;
     int device;
+    std::uint64_t stream;
 
     bool operator==(const PlanKey& other) const {
-        return n == other.n && device == other.device;
+        return n == other.n && device == other.device && stream == other.stream;
     }
 };
 
 struct PlanKeyHash {
     std::size_t operator()(const PlanKey& key) const {
         return (static_cast<std::size_t>(key.n) << 32) ^
-            static_cast<std::size_t>(key.device);
+            static_cast<std::size_t>(key.device) ^
+            static_cast<std::size_t>(key.stream);
     }
 };
 
 std::mutex plan_mutex;
 std::unordered_map<PlanKey, mufftHandle, PlanKeyHash> plans;
 
-mufftHandle get_plan(int n, int device) {
+mufftHandle get_plan(int n, int device, c10::musa::MUSAStream stream) {
     std::lock_guard<std::mutex> lock(plan_mutex);
-    const PlanKey key{n, device};
+    const PlanKey key{n, device, static_cast<std::uint64_t>(stream.id())};
     auto it = plans.find(key);
     if (it != plans.end()) {
         return it->second;
@@ -43,6 +46,11 @@ mufftHandle get_plan(int n, int device) {
         n,
         ", result=",
         static_cast<int>(result));
+    const mufftResult stream_result = mufftSetStream(plan, stream);
+    TORCH_CHECK(
+        stream_result == MUFFT_SUCCESS,
+        "muFFT stream binding failed, result=",
+        static_cast<int>(stream_result));
     plans.emplace(key, plan);
     return plan;
 }
@@ -70,9 +78,6 @@ torch::Tensor musa_irfft_graph(torch::Tensor spectrum, int64_t n) {
         " for n=",
         fft_size);
 
-    // muFFT's C2C path is graph-capture safe after its plan is created. Build
-    // the full Hermitian spectrum once per invocation, then execute one
-    // inverse transform per frame on the current MUSA stream.
     auto transposed = spectrum.permute({0, 2, 1}).contiguous();
     auto full_spectrum = torch::zeros(
         {batch, frames, fft_size},
@@ -84,13 +89,9 @@ torch::Tensor musa_irfft_graph(torch::Tensor spectrum, int64_t n) {
     }
 
     auto inverse = torch::empty({batch, frames, fft_size}, spectrum.options());
-    mufftHandle plan = get_plan(fft_size, spectrum.device().index());
     const auto stream = c10::musa::getCurrentMUSAStream(spectrum.device().index());
-    mufftResult result = mufftSetStream(plan, stream);
-    TORCH_CHECK(
-        result == MUFFT_SUCCESS,
-        "muFFT stream binding failed, result=",
-        static_cast<int>(result));
+    mufftHandle plan = get_plan(fft_size, spectrum.device().index(), stream);
+    mufftResult result = MUFFT_SUCCESS;
 
     for (int batch_idx = 0; batch_idx < batch; ++batch_idx) {
         for (int frame_idx = 0; frame_idx < frames; ++frame_idx) {
