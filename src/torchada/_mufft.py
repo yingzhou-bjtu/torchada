@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import atexit
-import os
 import os.path as osp
 import threading
 from types import ModuleType
@@ -15,6 +14,17 @@ MufftIrfft = Callable[[torch.Tensor, int], torch.Tensor]
 mufft_irfft: MufftIrfft | None = None
 mufft_clear_plans: Callable[[], None] | None = None
 mufft_load_lock = threading.Lock()
+
+
+def _musa_home() -> str:
+    from .utils.cpp_extension import CUDA_HOME
+
+    if CUDA_HOME is None:
+        raise RuntimeError(
+            "MUSA toolchain path is unavailable; set MUSA_HOME or install MUSA "
+            "before using musa_irfft_graph"
+        )
+    return CUDA_HOME
 
 
 def load_mufft_ops() -> MufftIrfft:
@@ -30,7 +40,7 @@ def load_mufft_ops() -> MufftIrfft:
                 source = osp.join(package_dir, "_mufft_src", "musa_irfft.cpp")
                 torch_musa_dir = osp.dirname(torch_musa.__file__)
                 torch_musa_parent = osp.dirname(torch_musa_dir)
-                musa_home = os.environ.get("MUSA_HOME", "/usr/local/musa")
+                musa_home = _musa_home()
                 torch_musa_lib = osp.join(torch_musa_dir, "lib")
 
                 module: ModuleType = load(
@@ -58,8 +68,10 @@ def load_mufft_ops() -> MufftIrfft:
 
 
 def clear_mufft_plans() -> None:
-    if mufft_clear_plans is not None:
-        mufft_clear_plans()
+    with mufft_load_lock:
+        clear = mufft_clear_plans
+    if clear is not None:
+        clear()
 
 
 def musa_irfft_graph(spectrum: torch.Tensor, n: int) -> torch.Tensor:

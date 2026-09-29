@@ -4,7 +4,6 @@
 #include <torch_musa/csrc/core/MUSAStream.h>
 
 #include <cstdint>
-#include <iterator>
 #include <limits>
 #include <mutex>
 #include <unordered_map>
@@ -35,28 +34,16 @@ struct PlanKeyHash {
 
 struct PlanEntry {
     mufftHandle handle;
-    std::uint64_t last_used;
     c10::musa::MUSAStream stream;
-};
-
-struct RetiredPlan {
-    mufftHandle handle;
-    c10::musa::MUSAStream stream;
-    bool synchronize;
-};
-
-struct PlanSelection {
-    mufftHandle handle;
-    std::vector<RetiredPlan> retired;
 };
 
 std::mutex plan_mutex;
 std::unordered_map<PlanKey, PlanEntry, PlanKeyHash> plans;
-std::uint64_t use_counter = 0;
 
-constexpr std::size_t max_cached_plans = 32;
-
-PlanSelection get_plan(
+// A captured graph may replay a plan long after capture.  Plans therefore stay
+// alive until explicit process cleanup instead of being evicted while graphs
+// can still reference them.
+mufftHandle get_plan(
     int n,
     int transform_count,
     int device,
@@ -70,8 +57,7 @@ PlanSelection get_plan(
         std::lock_guard<std::mutex> lock(plan_mutex);
         auto it = plans.find(key);
         if (it != plans.end()) {
-            it->second.last_used = ++use_counter;
-            return {it->second.handle, {}};
+            return it->second.handle;
         }
     }
 
@@ -95,33 +81,31 @@ PlanSelection get_plan(
         ", result=",
         static_cast<int>(result));
     const mufftResult stream_result = mufftSetStream(plan, stream);
-    TORCH_CHECK(
-        stream_result == MUFFT_SUCCESS,
-        "muFFT stream binding failed, result=",
-        static_cast<int>(stream_result));
+    if (stream_result != MUFFT_SUCCESS) {
+        mufftDestroy(plan);
+        TORCH_CHECK(
+            false,
+            "muFFT stream binding failed, result=",
+            static_cast<int>(stream_result));
+    }
 
-    std::vector<RetiredPlan> retired;
+    mufftHandle cached_plan = nullptr;
     {
         std::lock_guard<std::mutex> lock(plan_mutex);
         auto it = plans.find(key);
         if (it != plans.end()) {
-            it->second.last_used = ++use_counter;
-            retired.push_back({plan, stream, false});
-            return {it->second.handle, retired};
-        }
-        plans.emplace(key, PlanEntry{plan, ++use_counter, stream});
-        if (plans.size() > max_cached_plans) {
-            auto oldest = plans.begin();
-            for (auto candidate = std::next(plans.begin()); candidate != plans.end(); ++candidate) {
-                if (candidate->second.last_used < oldest->second.last_used) {
-                    oldest = candidate;
-                }
-            }
-            retired.push_back({oldest->second.handle, oldest->second.stream, true});
-            plans.erase(oldest);
+            cached_plan = it->second.handle;
+        } else {
+            plans.emplace(key, PlanEntry{plan, stream});
         }
     }
-    return {plan, retired};
+    if (cached_plan != nullptr) {
+        TORCH_CHECK(
+            mufftDestroy(plan) == MUFFT_SUCCESS,
+            "muFFT duplicate plan destruction failed");
+        return cached_plan;
+    }
+    return plan;
 }
 
 void clear_plans() {
@@ -181,23 +165,15 @@ torch::Tensor musa_irfft_graph(torch::Tensor spectrum, int64_t n) {
 
     auto inverse = torch::empty({batch, frames, fft_size}, spectrum.options());
     const auto stream = c10::musa::getCurrentMUSAStream(spectrum.device().index());
-    const auto selection = get_plan(
+    const auto plan = get_plan(
         fft_size,
         transform_count,
         spectrum.device().index(),
         stream);
-    for (const auto& retired : selection.retired) {
-        if (retired.synchronize) {
-            retired.stream.synchronize();
-        }
-        TORCH_CHECK(
-            mufftDestroy(retired.handle) == MUFFT_SUCCESS,
-            "muFFT retired plan destruction failed");
-    }
     auto* input = reinterpret_cast<mufftComplex*>(full_spectrum.data_ptr<c10::complex<float>>());
     auto* output = reinterpret_cast<mufftComplex*>(inverse.data_ptr<c10::complex<float>>());
     const mufftResult result =
-        mufftExecC2C(selection.handle, input, output, MUFFT_INVERSE);
+        mufftExecC2C(plan, input, output, MUFFT_INVERSE);
     TORCH_CHECK(
         result == MUFFT_SUCCESS,
         "muFFT inverse execution failed, result=",
