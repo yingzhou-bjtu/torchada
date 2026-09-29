@@ -7,7 +7,7 @@ from torchada import musa_irfft_graph
 @pytest.mark.musa
 def test_musa_irfft_graph_keeps_one_plan_per_stream() -> None:
     n = 8
-    spectrum = torch.randn(1, n // 2 + 1, 2, device="musa", dtype=torch.complex64)
+    spectrum = torch.randn(2, n // 2 + 1, 3, device="musa", dtype=torch.complex64)
     expected = torch.fft.irfft(spectrum.cpu(), n=n, dim=1, norm="backward")
     stream_a = torch.musa.Stream()
     stream_b = torch.musa.Stream()
