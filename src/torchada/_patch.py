@@ -21,16 +21,19 @@ Usage:
     g = torch.cuda.CUDAGraph()  # Uses MUSAGraph on MUSA
 """
 
+import atexit
 import functools
 import inspect
 import logging
 import os
+import shutil
 import sys
+import tempfile
 import threading
 import time
 import warnings
 from types import ModuleType, SimpleNamespace
-from typing import Any, Callable, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import torch
 
@@ -1176,9 +1179,7 @@ def _discover_factory_functions() -> Tuple[List[str], List[str]]:
     if not names:
         names.update(_FALLBACK_FACTORY_FUNCTIONS)
         # torch does not device-inject into the ``*_like`` family.
-        device_injectable.update(
-            n for n in _FALLBACK_FACTORY_FUNCTIONS if not n.endswith("_like")
-        )
+        device_injectable.update(n for n in _FALLBACK_FACTORY_FUNCTIONS if not n.endswith("_like"))
     # ``*_like`` variants accept device= but are not device-injected by torch.
     names |= {n + "_like" for n in tuple(names) if callable(getattr(torch, n + "_like", None))}
     for extra in _EXTRA_FACTORY_FUNCTIONS:
@@ -2204,7 +2205,25 @@ class _CDLLWrapper:
     def __getattr__(self, name: str):
         cdll = object.__getattribute__(self, "_cdll")
         translated_name = self._translate_name(name)
-        value = getattr(cdll, translated_name)
+        try:
+            value = getattr(cdll, translated_name)
+        except AttributeError:
+            # Current MCCL images do not export NCCL's optional
+            # InitRankConfig entry point. Preserve SGLang's four-argument
+            # call ABI while using the base communicator initializer.
+            if (
+                object.__getattribute__(self, "_lib_type") == "mccl"
+                and translated_name == "mcclCommInitRankConfig"
+            ):
+                init_rank = getattr(cdll, "mcclCommInitRank")
+
+                def init_rank_config(world_size, unique_id, rank, config):
+                    del config
+                    return init_rank(world_size, unique_id, rank)
+
+                value = init_rank_config
+            else:
+                raise
         # Cache in __dict__ for faster subsequent access
         object.__setattr__(self, name, value)
         return value
@@ -2561,6 +2580,422 @@ def _patch_ctypes_cdll():
     ctypes.CDLL = PatchedCDLL
 
 
+@patch_function
+def _patch_sglang_jit_toolchain():
+    """Compile SGLang's custom ninja JIT with mcc on MUSA.
+
+    SGLang generates its own ``build.ninja`` instead of going through
+    ``torch.utils.cpp_extension``. On CUDA that file invokes nvcc, CUDA
+    gencode, and libcudart. Map those three to mcc, ``--offload-arch``,
+    and musart so ``load_jit("fused_rope", ...)`` can compile on MUSA.
+    """
+    if not is_musa_platform():
+        return
+    if any(getattr(finder, "_torchada_sglang_jit", False) for finder in sys.meta_path):
+        return
+
+    class _SglangJitLoader:
+        def __init__(self, loader, apply):
+            self.loader = loader
+            self.apply = apply
+
+        def create_module(self, spec):
+            if hasattr(self.loader, "create_module"):
+                return self.loader.create_module(spec)
+            return None
+
+        def exec_module(self, module):
+            self.loader.exec_module(module)
+            self.apply(module)
+
+    class _SglangJitFinder:
+        _torchada_sglang_jit = True
+        _targets = {
+            "sglang.kernels.jit.utils.compile.toolchain": _apply_sglang_jit_toolchain,
+            "sglang.kernels.jit.utils.compile.ninja": _apply_sglang_jit_ninja,
+        }
+
+        def find_spec(self, fullname, path, target=None):
+            apply = self._targets.get(fullname)
+            if apply is None:
+                return None
+            if fullname in sys.modules:
+                apply(sys.modules[fullname])
+                return None
+            for finder in sys.meta_path:
+                if finder is self:
+                    continue
+                find_spec = getattr(finder, "find_spec", None)
+                if find_spec is None:
+                    continue
+                spec = find_spec(fullname, path, target)
+                if spec is None or spec.loader is None:
+                    continue
+                spec.loader = _SglangJitLoader(spec.loader, apply)
+                return spec
+            return None
+
+    sys.meta_path.insert(0, _SglangJitFinder())
+    toolchain = sys.modules.get("sglang.kernels.jit.utils.compile.toolchain")
+    if toolchain is not None:
+        _apply_sglang_jit_toolchain(toolchain)
+    ninja = sys.modules.get("sglang.kernels.jit.utils.compile.ninja")
+    if ninja is not None:
+        _apply_sglang_jit_ninja(ninja)
+
+
+def _translate_nvcc_flags_for_mcc(flags):
+    """Drop nvcc-only flags that mcc rejects, keep host PIC as -fPIC."""
+    translated = []
+    skip_next = False
+    for flag in flags:
+        if skip_next:
+            if flag == "-fPIC" and "-fPIC" not in translated:
+                translated.append("-fPIC")
+            skip_next = False
+            continue
+        if flag in {"-Xcompiler", "--compiler-options"}:
+            skip_next = True
+            continue
+        if flag.startswith("-Xcompiler=") or flag.startswith("--compiler-options="):
+            value = flag.split("=", 1)[1]
+            if value == "-fPIC" and "-fPIC" not in translated:
+                translated.append("-fPIC")
+            continue
+        if flag in {"--expt-relaxed-constexpr", "-expt-relaxed-constexpr"}:
+            continue
+        if flag.startswith("-gencode"):
+            continue
+        translated.append(flag)
+    return translated
+
+
+SGLANG_JIT_TENSOR_H_ICE = "constexpr auto max_type = stdr::max(map | stdv::keys);"
+SGLANG_JIT_TENSOR_H_REWRITE = """constexpr auto max_type = [&] {
+    auto result = map.front().first;
+    for (const auto& item : map) {
+      result = std::max(result, item.first);
+    }
+    return result;
+  }();"""
+
+SGLANG_JIT_INTEGER_RANGE = (
+    "template <typename T> struct IntegerRange { T begin_value; T end_value; "
+    "struct iterator { T value; constexpr T operator*() const { return value; } "
+    "constexpr iterator& operator++() { ++value; return *this; } "
+    "constexpr bool operator!=(const iterator& other) const { return value != other.value; } }; "
+    "constexpr iterator begin() const { return iterator{begin_value}; } "
+    "constexpr iterator end() const { return iterator{end_value}; } };\n\n"
+)
+
+SGLANG_JIT_MUSA_GRID_CONSTANT = (
+    "#if defined(__MUSACC__) && !defined(__grid_constant__)\n"
+    "#define __grid_constant__\n"
+    "#endif\n"
+)
+
+_sglang_jit_overlay_cache: Dict[Tuple[str, ...], Optional[str]] = {}
+_sglang_jit_overlay_lock = threading.Lock()
+
+
+def _cleanup_sglang_jit_overlays() -> None:
+    with _sglang_jit_overlay_lock:
+        overlay_roots = [
+            overlay_root
+            for overlay_root in _sglang_jit_overlay_cache.values()
+            if overlay_root is not None
+        ]
+        _sglang_jit_overlay_cache.clear()
+    for overlay_root in overlay_roots:
+        shutil.rmtree(overlay_root, ignore_errors=True)
+
+
+atexit.register(_cleanup_sglang_jit_overlays)
+
+
+def _replace_sglang_jit_source(
+    source: str,
+    old: str,
+    new: str,
+    *,
+    filename: str,
+    required: bool = False,
+    expected_count: int | None = None,
+) -> str:
+    count = source.count(old)
+    if expected_count is None and required:
+        expected_count = 1
+    if expected_count is not None and count != expected_count:
+        raise RuntimeError(
+            f"Expected exactly {expected_count} {old!r} matches in SGLang JIT "
+            f"header {filename!r}, found {count}"
+        )
+    return source.replace(old, new)
+
+
+def _rewrite_sglang_jit_header(filename: str, source: str) -> str:
+    if (
+        filename == "utils.cuh"
+        and "#if defined(__MUSACC__) && !defined(__grid_constant__)" not in source
+    ):
+        source = _replace_sglang_jit_source(
+            source,
+            "#pragma once\n",
+            "#pragma once\n" + SGLANG_JIT_MUSA_GRID_CONSTANT,
+            filename=filename,
+            required=True,
+        )
+    if "#include <ranges>" in source:
+        source = _replace_sglang_jit_source(
+            source,
+            "#include <ranges>\n",
+            "",
+            filename=filename,
+            required=True,
+        )
+        if "#include <ranges>" in source:
+            raise RuntimeError(f"Failed to remove <ranges> from SGLang JIT header {filename!r}")
+    for alias in (
+        "namespace stdr = std::ranges;\n",
+        "namespace stdv = stdr::views;\n",
+    ):
+        if alias[:-1] in source:
+            source = _replace_sglang_jit_source(
+                source,
+                alias,
+                "",
+                filename=filename,
+                required=True,
+            )
+            if alias[:-1] in source:
+                raise RuntimeError(
+                    f"Failed to remove ranges alias from SGLang JIT header {filename!r}"
+                )
+    if filename == "tensor.h":
+        source = _replace_sglang_jit_source(
+            source,
+            SGLANG_JIT_TENSOR_H_ICE,
+            SGLANG_JIT_TENSOR_H_REWRITE,
+            filename=filename,
+            required=True,
+        )
+        source = _replace_sglang_jit_source(
+            source,
+            "#ifdef __CUDACC__",
+            "#if defined(__CUDACC__) || defined(__MUSACC__)",
+            filename=filename,
+            expected_count=2,
+        )
+    replacements = (
+        (
+            "return stdr::empty(m_options) || (stdr::find(m_options, value) != stdr::end(m_options));",
+            "return m_options.empty() || (std::find(m_options.begin(), m_options.end(), value) != m_options.end());",
+        ),
+        (
+            "return stdr::empty(m_options) || (stdr::any_of(m_options, [value](const DLDevice& opt) {",
+            "return m_options.empty() || (std::any_of(m_options.begin(), m_options.end(), [value](const DLDevice& opt) {",
+        ),
+    )
+    for old, new in replacements:
+        if old.split("(", 1)[0] in source:
+            source = _replace_sglang_jit_source(source, old, new, filename=filename, required=True)
+    had_iota = "stdv::iota" in source
+    if had_iota:
+        iota_replacements = 0
+        for old, new in (
+            (
+                "return stdv::iota(static_cast<T>(0), end);",
+                "return IntegerRange<T>{static_cast<T>(0), end};",
+            ),
+            (
+                "return stdv::iota(start, end);",
+                "return IntegerRange<T>{start, end};",
+            ),
+        ):
+            count = source.count(old)
+            iota_replacements += count
+            source = source.replace(old, new)
+        if iota_replacements == 0 or "stdv::iota" in source:
+            raise RuntimeError(f"Failed to rewrite stdv::iota in SGLang JIT header {filename!r}")
+        if "struct IntegerRange" not in source:
+            idx = source.find("template <std::integral T>\ninline auto irange")
+            if idx == -1:
+                idx = source.find("inline auto irange")
+            if idx != -1:
+                source = source[:idx] + SGLANG_JIT_INTEGER_RANGE + source[idx:]
+            else:
+                raise RuntimeError(
+                    f"Failed to insert IntegerRange in SGLang JIT header {filename!r}"
+                )
+    return source
+
+
+def _rewrite_sglang_jit_tensor_h(include_paths):
+    cache_key = tuple(os.path.realpath(path) for path in include_paths)
+    with _sglang_jit_overlay_lock:
+        if cache_key in _sglang_jit_overlay_cache:
+            return _sglang_jit_overlay_cache[cache_key]
+        overlay_root = None
+        for path in cache_key:
+            kernel_include = os.path.join(path, "sgl_kernel")
+            if not os.path.isdir(kernel_include):
+                continue
+            for dirpath, _, filenames in os.walk(kernel_include):
+                rel = os.path.relpath(dirpath, kernel_include)
+                for filename in filenames:
+                    src = os.path.join(dirpath, filename)
+                    with open(src, "r", encoding="utf-8", errors="replace") as source_file:
+                        source = source_file.read()
+                    updated = _rewrite_sglang_jit_header(filename, source)
+                    if updated == source:
+                        continue
+                    if overlay_root is None:
+                        overlay_root = tempfile.mkdtemp(prefix="torchada-sglang-jit-")
+                        overlay_kernel = os.path.join(overlay_root, "sgl_kernel")
+                        shutil.copytree(kernel_include, overlay_kernel, dirs_exist_ok=True)
+                    dest_dir = overlay_kernel if rel == "." else os.path.join(overlay_kernel, rel)
+                    os.makedirs(dest_dir, exist_ok=True)
+                    with open(
+                        os.path.join(dest_dir, filename), "w", encoding="utf-8"
+                    ) as destination_file:
+                        destination_file.write(updated)
+            if overlay_root is not None:
+                break
+        _sglang_jit_overlay_cache[cache_key] = overlay_root
+        return overlay_root
+
+
+def _apply_sglang_jit_ninja(ninja):
+    if getattr(ninja, "_torchada_sglang_jit", False):
+        return
+    original_generate = ninja.generate
+
+    def generate(spec):
+        cuda_cflags = tuple(_translate_nvcc_flags_for_mcc(spec.cuda_cflags))
+        include_paths = list(spec.include_paths)
+        search_paths = include_paths[:]
+        toolchain = getattr(ninja, "toolchain", None)
+        if toolchain is None:
+            toolchain = sys.modules.get("sglang.kernels.jit.utils.compile.toolchain")
+        base_include_paths = getattr(toolchain, "base_include_paths", None)
+        if callable(base_include_paths):
+            search_paths = list(base_include_paths()) + search_paths
+        overlay_root = _rewrite_sglang_jit_tensor_h(search_paths)
+        if overlay_root and overlay_root not in include_paths:
+            include_paths.insert(0, overlay_root)
+        if cuda_cflags != spec.cuda_cflags or tuple(include_paths) != spec.include_paths:
+            try:
+                payload = vars(spec)
+            except TypeError:
+                payload = {name: getattr(spec, name) for name in spec.__struct_fields__}
+            spec = spec.__class__(
+                **{
+                    **payload,
+                    "cuda_cflags": cuda_cflags,
+                    "include_paths": tuple(include_paths),
+                }
+            )
+        return original_generate(spec)
+
+    ninja.generate = generate
+    ninja._torchada_sglang_jit = True
+
+
+def _apply_sglang_jit_toolchain(toolchain):
+    if getattr(toolchain, "_torchada_sglang_jit", False):
+        return
+    is_hip_runtime = getattr(toolchain, "is_hip_runtime", None)
+    if callable(is_hip_runtime) and is_hip_runtime():
+        return
+
+    from torchada._cpp_ops import _detect_musa_arch
+    from torchada.utils.cpp_extension import (
+        CUDA_HOME,
+        _with_explicit_musa_language,
+        stable_compat_include_dir,
+    )
+
+    original_cuda_home = toolchain.cuda_home
+    original_device_compiler_path = toolchain.device_compiler_path
+    original_base_cuda_flags = toolchain.base_cuda_flags
+    original_base_include_paths = toolchain.base_include_paths
+    original_base_link_flags = toolchain.base_link_flags
+    original_cuda_home = original_cuda_home()
+
+    def cuda_home() -> str:
+        return CUDA_HOME or original_cuda_home
+
+    def device_compiler_path() -> str:
+        musa_home = cuda_home()
+        if musa_home:
+            return os.path.join(musa_home, "bin", "mcc")
+        return original_device_compiler_path()
+
+    def target_flags():
+        arch = os.environ.get("MTGPU_TARGET") or _detect_musa_arch()
+        return [f"--offload-arch={arch}"]
+
+    def base_cuda_flags():
+        return _with_explicit_musa_language(
+            _translate_nvcc_flags_for_mcc(original_base_cuda_flags())
+        )
+
+    def base_include_paths():
+        paths = [stable_compat_include_dir()]
+        for path in original_base_include_paths():
+            if path not in paths:
+                paths.append(path)
+        musa_home = cuda_home()
+        if musa_home:
+            include_dir = os.path.join(musa_home, "include")
+            if include_dir not in paths:
+                paths.append(include_dir)
+        return paths
+
+    def base_link_flags(*, with_device: bool):
+        flags = list(original_base_link_flags(with_device=with_device))
+        if not with_device:
+            return flags
+        musa_home = cuda_home()
+        cuda_lib64 = (
+            os.path.normpath(os.path.join(original_cuda_home, "lib64"))
+            if original_cuda_home
+            else None
+        )
+        musa_lib = os.path.join(musa_home, "lib") if musa_home else None
+        translated = []
+        replaced_runtime = False
+        replaced_cuda_lib = False
+        for flag in flags:
+            if flag == "-lcudart":
+                translated.append("-lmusart")
+                replaced_runtime = True
+                continue
+            if (
+                musa_lib
+                and cuda_lib64
+                and flag.startswith("-L")
+                and os.path.normpath(flag[2:]) == cuda_lib64
+            ):
+                translated.append(f"-L{musa_lib}")
+                replaced_cuda_lib = True
+                continue
+            translated.append(flag)
+        if musa_lib and not replaced_cuda_lib:
+            translated.append(f"-L{musa_lib}")
+        if not replaced_runtime:
+            translated.append("-lmusart")
+        return translated
+
+    toolchain.cuda_home = cuda_home
+    toolchain.device_compiler_path = device_compiler_path
+    toolchain.target_flags = target_flags
+    toolchain.base_cuda_flags = base_cuda_flags
+    toolchain.base_include_paths = base_include_paths
+    toolchain.base_link_flags = base_link_flags
+    toolchain._torchada_sglang_jit = True
+
+
 def apply_patches():
     """
     Apply all necessary patches for CUDA to MUSA translation.
@@ -2585,6 +3020,7 @@ def apply_patches():
     - torch.mm / torch.bmm out_dtype= backport while the MUSA dtype overload
       does not write its result
     - torch.utils.cpp_extension (CUDAExtension, BuildExtension) -> MUSA versions
+    - sglang.kernels.jit toolchain nvcc/gencode/libcudart -> mcc/--offload-arch/musart
     - CUDA_VISIBLE_DEVICES -> MUSA_VISIBLE_DEVICES environment fallback
     - torch._inductor.autotune_process.CUDA_VISIBLE_DEVICES -> MUSA_VISIBLE_DEVICES
     - torch.accelerator.synchronize() -> torch.musa.synchronize()
