@@ -914,6 +914,7 @@ def include_paths(
         # torch_musa shipping the real header wins.
         if include_device:
             paths.append(stable_compat_include_dir())
+            paths.append(forwarding_include_dir())
         if not torch_include_dirs:
             paths = [path for path in paths if not _is_torch_path(path, "include")]
         return paths
@@ -952,6 +953,15 @@ def stable_compat_include_dir() -> str:
         os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
         "csrc",
         "stable_compat",
+    )
+
+
+def forwarding_include_dir() -> str:
+    """Directory holding CUDA-named headers for native MUSA consumers."""
+    return os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "csrc",
+        "forwarding",
     )
 
 
@@ -1328,7 +1338,9 @@ def _get_build_extension_class():
                     # site-packages: porting this directory in place rewrites
                     # the CUDA-named forwarding shims into self-recursive MUSA
                     # declarations and breaks every subsequent native build.
-                    if _path_overlaps_any(path, [stable_compat_include_dir()]):
+                    if _path_overlaps_any(
+                        path, [stable_compat_include_dir(), forwarding_include_dir()]
+                    ):
                         return True
 
                     is_system_path = (

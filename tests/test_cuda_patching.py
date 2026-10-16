@@ -3872,26 +3872,53 @@ class TestStableCompatHeaders:
     def test_include_paths_appends_stable_compat_on_musa(self):
         """include_paths() auto-appends the stable_compat dir for device builds on MUSA."""
         import torchada
-        from torchada.utils.cpp_extension import include_paths, stable_compat_include_dir
+        from torchada.utils.cpp_extension import (
+            forwarding_include_dir,
+            include_paths,
+            stable_compat_include_dir,
+        )
 
         if not torchada.is_musa_platform():
             pytest.skip("Only applicable on MUSA platform")
 
         paths = include_paths(device_type="cuda")
         assert stable_compat_include_dir() in paths
-        # It must be appended LAST so a real future torch_musa header wins.
-        assert paths[-1] == stable_compat_include_dir()
+        assert forwarding_include_dir() in paths
+        assert paths[-2:] == [stable_compat_include_dir(), forwarding_include_dir()]
 
     def test_include_paths_omits_stable_compat_for_cpu_only(self):
         """include_paths(device_type='cpu') does not add the device stable_compat dir."""
         import torchada
-        from torchada.utils.cpp_extension import include_paths, stable_compat_include_dir
+        from torchada.utils.cpp_extension import (
+            forwarding_include_dir,
+            include_paths,
+            stable_compat_include_dir,
+        )
 
         if not torchada.is_musa_platform():
             pytest.skip("Only applicable on MUSA platform")
 
         paths = include_paths(device_type="cpu")
         assert stable_compat_include_dir() not in paths
+        assert forwarding_include_dir() not in paths
+
+    def test_forwarding_headers_expose_sglang_runtime_and_fp8_names(self):
+        import os
+
+        from torchada.utils.cpp_extension import forwarding_include_dir
+
+        root = forwarding_include_dir()
+        runtime = open(os.path.join(root, "cuda_runtime.h"), encoding="utf-8").read()
+        fp8 = open(os.path.join(root, "cuda_fp8.h"), encoding="utf-8").read()
+        for name in (
+            "cudaGetLastError",
+            "cudaGetErrorString",
+            "cudaLaunchAttribute",
+            "cudaLaunchConfig_t",
+        ):
+            assert name in runtime
+        for name in ("__nv_fp8_e4m3", "__nv_fp8x2_e4m3", "__nv_fp8x4_e5m2"):
+            assert name in fp8
 
 
 class TestStableHeaderBackport:
