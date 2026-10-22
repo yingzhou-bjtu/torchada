@@ -29,12 +29,13 @@ Usage:
 
 import torch
 
-__version__ = "0.1.101"
+__version__ = "0.1.102"
 
 from . import cuda, utils
 
 # C++ operator overrides are automatically loaded on MUSA platform
 from ._cpp_ops import load_cpp_ops
+from ._mufft import musa_irfft_graph
 from ._patch import apply_patches, get_original_init_process_group, is_patched
 from ._platform import (
     Platform,
@@ -129,6 +130,7 @@ __all__ = [
     "get_platform",
     "get_backend",
     "apply_rope_inplace",
+    "musa_irfft_graph",
     # Device helpers
     "is_gpu_device",
     "is_cuda_like_device",
