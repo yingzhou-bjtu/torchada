@@ -154,7 +154,8 @@ def is_gpu_device(device) -> bool:
     Use this function instead of `device.type == "cuda"` for portable code.
 
     Args:
-        device: A torch.device object, or an object with a .device attribute
+        device: A torch.device object, a device string, or an object exposing
+            the tensor-style ``is_cuda`` compatibility attribute
 
     Returns:
         True if the device is cuda or musa, False otherwise
@@ -163,12 +164,18 @@ def is_gpu_device(device) -> bool:
         # Instead of:
         #   if tensor.device.type == "cuda":
         # Use:
-        #   if torchada.is_gpu_device(tensor.device):
+        #   if torchada.is_gpu_device(tensor):
         #       ...
     """
     import torch
 
-    # Handle tensors, modules, etc. that have a .device attribute
+    # Preserve torchada's tensor is_cuda compatibility contract. In particular,
+    # MUSA tensors report is_cuda=True while their physical device type is musa.
+    is_cuda = getattr(device, "is_cuda", None)
+    if isinstance(is_cuda, bool):
+        return is_cuda
+
+    # Handle modules and other objects that expose a device attribute.
     if hasattr(device, "device"):
         device = device.device
 

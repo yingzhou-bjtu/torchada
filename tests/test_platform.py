@@ -96,9 +96,14 @@ class TestPlatformDetection:
 
         import torchada
 
+        class CudaLikeTensor:
+            is_cuda = True
+            device = torch.device("cpu")
+
         # Test with torch.device objects
         cpu_device = torch.device("cpu")
         assert torchada.is_gpu_device(cpu_device) is False
+        assert torchada.is_gpu_device(CudaLikeTensor()) is True
 
         # Test with string device specs
         assert torchada.is_gpu_device("cpu") is False
@@ -115,6 +120,10 @@ class TestPlatformDetection:
         if torchada.is_musa_platform():
             musa_device = torch.device("musa:0")
             assert torchada.is_gpu_device(musa_device) is True
+
+            musa_tensor = torch.randn(1, device=musa_device)
+            assert musa_tensor.is_cuda is True
+            assert torchada.is_gpu_device(musa_tensor) is True
 
             # torch.device("cuda") is translated to musa on MUSA platform
             cuda_device = torch.device("cuda:0")
